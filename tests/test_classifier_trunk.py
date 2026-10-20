@@ -21,6 +21,7 @@ from hqnn_forge.models import (
     HybridBinaryClassifier,
     MulticlassHybridClassifier,
     ParallelHybridClassifier,
+    _trunk,
 )
 from hqnn_forge.models._trunk import QuantumTrunk
 
@@ -135,6 +136,10 @@ class TestMulticlassTrainingNoise:
         ({"encoding_type": "iqp", "embedding_rotation": "Y"}, "IQP embedding has no rotation"),
         ({"encoding_type": "kernel"}, "Unsupported encoding_type"),
         ({"noise_method": "kraus"}, "noise_method must be"),
+        ({"dropout_p": 1.0}, r"dropout_p must be in \[0, 1\); got 1\.0"),
+        ({"dropout_p": -0.1}, r"dropout_p must be in \[0, 1\); got -0\.1"),
+        ({"dropout_p": 1.5}, r"dropout_p must be in \[0, 1\); got 1\.5"),
+        ({"dropout_p": float("nan")}, r"dropout_p must be in \[0, 1\); got nan"),
     ],
 )
 def test_every_model_rejects_the_same_trunk_options(
@@ -144,21 +149,18 @@ def test_every_model_rejects_the_same_trunk_options(
         _build(cls, **options)
 
 
-@pytest.mark.parametrize("cls", [HybridBinaryClassifier, ParallelHybridClassifier])
-def test_binary_models_keep_their_unvalidated_dropout_p(cls: type) -> None:
-    # The refactor leaves dropout_p exactly as the binary models took it
-    # before: handed to nn.Dropout unchecked, so 1.0 and negative values
-    # build (and such checkpoints load).  Tightening this is #404.
-    assert isinstance(_build(cls, dropout_p=1.0).dropout, nn.Dropout)
-    assert isinstance(_build(cls, dropout_p=-0.1).dropout, nn.Identity)
-    with pytest.raises(ValueError, match="dropout probability has to be between 0 and 1"):
-        _build(cls, dropout_p=1.5)
+@pytest.mark.parametrize("cls", MODELS)
+def test_dropout_p_is_refused_before_any_layer_is_built(
+    cls: type, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Backend resolution comes before the encoder and circuit are built, so if
+    # it is never reached, neither are they.
+    def unreachable(*args: object, **kwargs: object) -> None:
+        raise AssertionError("dropout_p was not checked before the layers were built")
 
-
-@pytest.mark.parametrize("dropout_p", [1.0, -0.1])
-def test_multiclass_keeps_its_dropout_range(dropout_p: float) -> None:
+    monkeypatch.setattr(_trunk, "resolve_backend", unreachable)
     with pytest.raises(ValueError, match=r"dropout_p must be in \[0, 1\)"):
-        _build(MulticlassHybridClassifier, dropout_p=dropout_p)
+        _build(cls, dropout_p=1.0)
 
 
 class TestOneImplementation:

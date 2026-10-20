@@ -305,6 +305,28 @@ class TestFailures:
             load_checkpoint(other, allow_version_mismatch=True), HybridBinaryClassifier
         )
 
+    @pytest.mark.parametrize("dropout_p", [-0.1, 1.0])
+    def test_out_of_range_dropout_p_names_the_override(
+        self, saved: tuple, tmp_path: Path, dropout_p: float
+    ) -> None:
+        # A binary checkpoint written before #404 can hold a dropout_p the
+        # classifiers now refuse.  Loading it says how to load it.
+        model, path = saved
+        payload = torch.load(path, weights_only=True)
+        payload["config"]["dropout_p"] = dropout_p
+        old = _save_payload(payload, tmp_path / "old_dropout.pt")
+        with pytest.raises(
+            ValueError,
+            match=rf"dropout_p={dropout_p}, outside \[0, 1\).*load_checkpoint\(path, dropout_p=0\.0\)",
+        ):
+            load_checkpoint(old)
+        loaded = load_checkpoint(old, dropout_p=0.0)
+        assert loaded.get_config()["dropout_p"] == 0.0
+        x = torch.randn(5, 6)
+        model.eval()
+        with torch.no_grad():
+            torch.testing.assert_close(loaded(x), model(x), rtol=0, atol=0)
+
     def test_format_version_mismatch(self, saved: tuple, tmp_path: Path) -> None:
         _, path = saved
         payload = torch.load(path, weights_only=True)
