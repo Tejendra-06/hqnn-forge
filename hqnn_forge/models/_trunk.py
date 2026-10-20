@@ -219,10 +219,11 @@ class QuantumTrunk(nn.Module):
         """
         validate_encoder_activation(encoder_activation)
         validate_init(init_strategy, init_std)
-        # dropout_p is deliberately not validated here: the binary models have
-        # always handed it to nn.Dropout unchecked, and tightening that changes
-        # which checkpoints load, so it is its own change (#404).  The
-        # multiclass model keeps its own [0, 1) check.
+        # Checked before any layer is built.  1.0 would zero the head's input in
+        # train mode and stop every gradient; a negative value silently trains
+        # with no dropout while get_config records it (#404).
+        if not 0.0 <= dropout_p < 1.0:
+            raise ValueError(f"dropout_p must be in [0, 1); got {dropout_p}.")
         if classical_encoder is not None and not use_classical_encoder:
             raise ValueError(
                 "classical_encoder replaces the built-in encoder and needs "
