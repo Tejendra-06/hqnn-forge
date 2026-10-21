@@ -36,8 +36,11 @@ import math
 import os
 import re
 import socket
+import struct
 import sys
 import warnings
+import zipfile
+import zlib
 from concurrent.futures import Future
 from pathlib import Path
 from threading import Thread
@@ -2684,10 +2687,107 @@ class TestCache:
         assert f"pruned cache ({cache_dir}): removed 1 file ({stale_size} bytes)" in captured
         assert "wrote" not in captured
 
-    def test_prune_cli_conflicts_with_no_cache(self, tmp_path: Path) -> None:
-        """--prune-cache cannot be combined with --no-cache (#575)."""
+    def test_prune_cli_conflicts_with_no_cache(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """--prune-cache cannot be combined with --no-cache (#575, #634)."""
         with pytest.raises(SystemExit):
             bench.main(["--no-cache", "--prune-cache", "--out", str(tmp_path / "out.jsonl")])
+        assert "--prune-cache cannot be used with --no-cache" in capsys.readouterr().err
+
+    def test_prune_cli_refuses_a_missing_cache_dir_and_creates_nothing(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A mistyped --cache-dir is an error, not an already-clean cache (#634)."""
+        missing = tmp_path / "x" / "typo"
+        with pytest.raises(SystemExit):
+            bench.main(["--prune-cache", "--cache-dir", str(missing)])
+        assert f"{missing} is not an existing directory" in capsys.readouterr().err
+        assert not missing.exists()
+        assert not missing.parent.exists()
+
+    def test_prune_cli_refuses_without_a_code_digest(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without CODE_SHA256 the prune says why, instead of advising --no-cache (#634)."""
+        monkeypatch.setattr(bench, "CODE_SHA256", None)
+        with pytest.raises(SystemExit):
+            bench.main(["--prune-cache", "--cache-dir", str(tmp_path)])
+        error_line = capsys.readouterr().err.strip().splitlines()[-1]
+        assert "--prune-cache cannot tell stale entries from current ones" in error_line
+        assert "--no-cache" not in error_line
+
+    def test_prune_cli_lists_unreadable_files(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The CLI prints the unreadable files it left in place (#634)."""
+        (tmp_path / "corrupt.npz").write_bytes(b"not a valid zip file")
+        assert bench.main(["--prune-cache", "--cache-dir", str(tmp_path)]) == []
+        out = capsys.readouterr().out
+        assert "unreadable cache files (not removed): corrupt.npz" in out
+        assert (tmp_path / "corrupt.npz").exists()
+
+    def test_prune_reports_a_stale_entry_whose_unlink_fails(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A stale entry that cannot be removed is reported as such, not as unreadable (#634)."""
+        stale = tmp_path / "stale.npz"
+        np.savez(
+            stale,
+            features=np.full((12, 4), 1.0),
+            seconds=np.float64(0.5),
+            code_sha256=np.array("0" * 64),
+            environment=np.array(json.dumps({})),
+        )
+        real_unlink = Path.unlink
+
+        def refuse(path: Path, missing_ok: bool = False) -> None:
+            if path == stale:
+                raise PermissionError(13, "Permission denied", str(path))
+            real_unlink(path, missing_ok=missing_ok)
+
+        monkeypatch.setattr(Path, "unlink", refuse)
+        report = bench.FeatureCache(tmp_path).prune()
+        assert report.files == 0
+        assert report.bytes == 0
+        assert report.unreadable == ()
+        assert len(report.not_removed) == 1
+        path, error = report.not_removed[0]
+        assert path == stale
+        assert "Permission denied" in error
+        assert stale.exists()
+
+        assert bench.main(["--prune-cache", "--cache-dir", str(tmp_path)]) == []
+        out = capsys.readouterr().out
+        assert "stale cache files that could not be removed: stale.npz (" in out
+        assert "Permission denied" in out
+        assert "unreadable cache files" not in out
+
+    def test_prune_lists_a_corrupt_compressed_entry_as_unreadable(self, tmp_path: Path) -> None:
+        """A compressed member that fails to inflate does not abort the prune (#634)."""
+        path = tmp_path / "compressed.npz"
+        np.savez_compressed(
+            path,
+            features=np.full((12, 4), 1.0),
+            seconds=np.float64(0.5),
+            code_sha256=np.array("0" * 64),
+            environment=np.array(json.dumps({})),
+        )
+        # Overwrite the first byte of the code_sha256 member's deflate stream with
+        # the reserved block type, so reading it raises zlib.error.
+        with zipfile.ZipFile(path) as zf:
+            offset = zf.getinfo("code_sha256.npy").header_offset
+        raw = bytearray(path.read_bytes())
+        name_len, extra_len = struct.unpack("<HH", raw[offset + 26 : offset + 30])
+        raw[offset + 30 + name_len + extra_len] = 0xFF
+        path.write_bytes(bytes(raw))
+        with pytest.raises(zlib.error), np.load(path, allow_pickle=False) as stored:
+            stored["code_sha256"]
+
+        report = bench.FeatureCache(tmp_path).prune()
+        assert report.unreadable == (path,)
+        assert report.files == 0
+        assert path.exists()
 
 
 # ---------------------------------------------------------------------------
