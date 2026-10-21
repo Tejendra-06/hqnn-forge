@@ -17,11 +17,11 @@ import torch.nn as nn
 
 from hqnn_forge.models import (
     BinaryClassifierBase,
+    ClassicalBaseline,
     ClassifierBase,
     HybridBinaryClassifier,
     MulticlassHybridClassifier,
     ParallelHybridClassifier,
-    _trunk,
 )
 from hqnn_forge.models._trunk import QuantumTrunk
 
@@ -149,18 +149,19 @@ def test_every_model_rejects_the_same_trunk_options(
         _build(cls, **options)
 
 
-@pytest.mark.parametrize("cls", MODELS)
-def test_dropout_p_is_refused_before_any_layer_is_built(
-    cls: type, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # Backend resolution comes before the encoder and circuit are built, so if
-    # it is never reached, neither are they.
-    def unreachable(*args: object, **kwargs: object) -> None:
-        raise AssertionError("dropout_p was not checked before the layers were built")
-
-    monkeypatch.setattr(_trunk, "resolve_backend", unreachable)
-    with pytest.raises(ValueError, match=r"dropout_p must be in \[0, 1\)"):
-        _build(cls, dropout_p=1.0)
+@pytest.mark.parametrize("cls", [*MODELS, ClassicalBaseline])
+def test_dropout_p_is_refused_before_any_layer_is_built(cls: type) -> None:
+    # Building a layer with init_seed=None draws from the global torch RNG, so an
+    # unchanged RNG state after the error means nothing was built first.
+    if cls is ClassicalBaseline:
+        options: dict[str, Any] = {"n_input_features": 4, "hidden_dims": [3]}
+    else:
+        options = {"n_input_features": 5, "n_qubits": 3, "n_layers": 2, **CPU}
+    torch.manual_seed(0)
+    state = torch.get_rng_state()
+    with pytest.raises(ValueError, match=r"dropout_p must be in \[0, 1\); got 1\.0"):
+        cls(**options, dropout_p=1.0)
+    assert torch.equal(torch.get_rng_state(), state)
 
 
 class TestOneImplementation:

@@ -317,7 +317,7 @@ class TestFailures:
         old = _save_payload(payload, tmp_path / "old_dropout.pt")
         with pytest.raises(
             ValueError,
-            match=rf"dropout_p={dropout_p}, outside \[0, 1\).*load_checkpoint\(path, dropout_p=0\.0\)",
+            match=rf"holds dropout_p={dropout_p}, outside \[0, 1\).*load_checkpoint\(path, dropout_p=0\.0\)",
         ):
             load_checkpoint(old)
         loaded = load_checkpoint(old, dropout_p=0.0)
@@ -326,6 +326,22 @@ class TestFailures:
         model.eval()
         with torch.no_grad():
             torch.testing.assert_close(loaded(x), model(x), rtol=0, atol=0)
+        if dropout_p < 0:
+            # A negative value built nn.Identity, so 0.0 rebuilds it exactly,
+            # in train mode too.
+            assert isinstance(loaded.dropout, torch.nn.Identity)
+            loaded.train()
+            model.train()
+            with torch.no_grad():
+                torch.testing.assert_close(loaded(x), model(x), rtol=0, atol=0)
+
+    def test_bad_dropout_p_override_is_not_blamed_on_the_file(self, saved: tuple) -> None:
+        # The file holds a valid dropout_p; 1.5 is the caller's own override, so
+        # the constructor's message is the right one, not the checkpoint hint.
+        _, path = saved
+        with pytest.raises(ValueError, match=r"dropout_p must be in \[0, 1\); got 1\.5") as info:
+            load_checkpoint(path, dropout_p=1.5)
+        assert "checkpoint holds" not in str(info.value)
 
     def test_format_version_mismatch(self, saved: tuple, tmp_path: Path) -> None:
         _, path = saved
