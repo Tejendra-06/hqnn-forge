@@ -524,7 +524,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `HybridBinaryClassifier` and `ParallelHybridClassifier` reject `dropout_p` outside `[0, 1)`
   with the same message as `MulticlassHybridClassifier`, before any layer is built. A
   checkpoint saved with such a value no longer loads as is; `load_checkpoint` names the fix,
-  `load_checkpoint(path, dropout_p=0.0)` (#651)
+  `load_checkpoint(path, dropout_p=0.0)`. `ClassicalBaseline` now words its `dropout_p` error
+  the same way (#651)
 
 ### Fixed
 - Circuit diagnostics (`circuit_summary`, `draw_circuit`, `count_inert_parameters`) no
