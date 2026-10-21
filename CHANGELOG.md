@@ -521,6 +521,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `examples/benchmark_rydberg_features.py`: clarify that `--quick` runs the predefined `QUICK`
   smoke-test configuration on the positive control and ignores conflicting grid, model,
   dataset-selection, and training options (#563)
+- `kernel_target_alignment` accepts array-like labels such as a NumPy array or pandas Series
+  (#539)
 - `HybridBinaryClassifier` and `ParallelHybridClassifier` reject `dropout_p` outside `[0, 1)`
   with the same message as `MulticlassHybridClassifier`, before any layer is built. A
   checkpoint saved with such a value no longer loads as is; `load_checkpoint` names the fix,
@@ -528,6 +530,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the same way (#651)
 
 ### Fixed
+- `examples/benchmark_rydberg_features.py` treats a feature cache entry it cannot read (empty, truncated, missing a field, or removed while being read) as a miss: it warns, recomputes the features and replaces the entry, instead of stopping the run (#621, #631)
 - Circuit diagnostics (`circuit_summary`, `draw_circuit`, `count_inert_parameters`) no
   longer fail on PennyLane 0.46 development builds, where `qml.transforms.decompose` stopped
   accepting a tape (#623)
