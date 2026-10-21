@@ -50,6 +50,16 @@ DEFAULT_INIT_STD = 0.1
 INIT_STRATEGIES = ("restricted", "block_local", "normal")
 
 
+def validate_dropout_p(dropout_p: float) -> None:
+    """Raise ``ValueError`` unless ``0 <= dropout_p < 1`` (NaN refused).
+
+    1.0 zeroes the head's input in train mode, so only the head's bias trains;
+    a negative value trains with no dropout while the config records it (#404).
+    """
+    if not 0.0 <= dropout_p < 1.0:
+        raise ValueError(f"dropout_p must be in [0, 1); got {dropout_p}.")
+
+
 def validate_init(init_strategy: str, init_std: float) -> None:
     """Raise ``ValueError`` for an unknown ``init_strategy`` or an ``init_std`` it would ignore."""
     if init_strategy not in INIT_STRATEGIES:
@@ -217,13 +227,9 @@ class QuantumTrunk(nn.Module):
         Returns the quantum layer's readout width, which the head reads.
         Raises ``ValueError`` for an inconsistent option.
         """
+        validate_dropout_p(dropout_p)
         validate_encoder_activation(encoder_activation)
         validate_init(init_strategy, init_std)
-        # Checked before any layer is built.  1.0 would zero the head's input in
-        # train mode and stop every gradient; a negative value silently trains
-        # with no dropout while get_config records it (#404).
-        if not 0.0 <= dropout_p < 1.0:
-            raise ValueError(f"dropout_p must be in [0, 1); got {dropout_p}.")
         if classical_encoder is not None and not use_classical_encoder:
             raise ValueError(
                 "classical_encoder replaces the built-in encoder and needs "
