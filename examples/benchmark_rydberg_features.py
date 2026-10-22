@@ -205,7 +205,9 @@ in the directory under their own names until pruned.  ``--prune-cache``
 or key environment differs from the running process, reports the files and
 bytes removed, and exits without running the benchmark; files it cannot read as
 an entry (such as ``*.part`` files or entries from before #543) are listed and
-left untouched (#575).
+left untouched (#575).  A ``--cache-dir`` that is not an existing directory is
+refused, and stale entries that cannot be removed are listed separately
+(:attr:`PruneReport.not_removed`) and left in place (#634).
 
 A power loss shortly after ``os.replace`` can still leave the final ``.npz`` entry empty or
 partially written.  On the next request, ``fetch`` treats an unreadable entry as a cache
@@ -355,8 +357,10 @@ import contextlib
 import dataclasses
 import errno
 import hashlib
+import importlib
 import itertools
 import json
+import lzma
 import math
 import numbers
 import os
@@ -1473,6 +1477,24 @@ _ENTRY_ERRORS = (
     zipfile.BadZipFile,
 )
 
+#: What reading a damaged compressed, encrypted or unsupported ``.npz`` member
+#: raises beyond :data:`_ENTRY_ERRORS`: a corrupt deflate, LZMA or (3.14+)
+#: Zstandard stream, an encrypted member, an unknown compression method.  bz2
+#: raises ``OSError``, already in :data:`_ENTRY_ERRORS`.
+_MEMBER_DECODE_ERRORS: tuple[type[Exception], ...] = (
+    zlib.error,
+    lzma.LZMAError,
+    RuntimeError,
+    NotImplementedError,
+)
+try:
+    _MEMBER_DECODE_ERRORS += (importlib.import_module("compression.zstd").ZstdError,)
+except ImportError:  # compression.zstd is new in Python 3.14
+    pass
+
+#: What :meth:`FeatureCache.prune` treats as an unreadable entry.
+_PRUNE_READ_ERRORS: tuple[type[Exception], ...] = (*_ENTRY_ERRORS, *_MEMBER_DECODE_ERRORS)
+
 
 def _stored_environment(stored: Mapping[str, Any]) -> dict[str, Any]:
     environment = json.loads(str(stored["environment"]))
@@ -1651,9 +1673,9 @@ class FeatureCache:
                         raw_env = _stored_environment(stored)
                         entry_key_env = key_environment(raw_env)
                         is_stale = entry_key_env != current_key_env
-            # A compressed, encrypted or unsupported member raises these; one such
-            # file, placed by something else, must not abort the whole prune.
-            except (*_ENTRY_ERRORS, zlib.error, RuntimeError, NotImplementedError):
+            # One damaged member, in a file placed by something else, must not
+            # abort the whole prune.
+            except _PRUNE_READ_ERRORS:
                 unreadable.append(path)
                 continue
 
@@ -1663,8 +1685,13 @@ class FeatureCache:
                     path.unlink()
                     removed_files += 1
                     removed_bytes += size
+                except FileNotFoundError:
+                    # Removed meanwhile by another prune or a fetch() replacing
+                    # it: nothing is left to report, and this process removed nothing.
+                    continue
                 except OSError as exc:
-                    not_removed.append((path, str(exc)))
+                    # strerror only: str(exc) repeats the full path.
+                    not_removed.append((path, exc.strerror or str(exc)))
 
         return PruneReport(
             files=removed_files,
@@ -2699,12 +2726,6 @@ def main(argv: Sequence[str] | None = None) -> list[dict[str, Any]]:
     """
     parser = _parser()
     args = parser.parse_args(argv)
-    # 0 is the one spelling of "no early stopping": a negative value is a typo, not a second one.
-    if args.patience < 0:
-        parser.error(
-            "argument --patience: must be 0 (no early stopping) or an integer >= 1; "
-            f"got {args.patience}"
-        )
     if args.prune_cache:
         if args.no_cache:
             parser.error("--prune-cache cannot be used with --no-cache")
@@ -2716,11 +2737,22 @@ def main(argv: Sequence[str] | None = None) -> list[dict[str, Any]]:
                 "so there is no cache to prune"
             )
         if CODE_SHA256 is None:
-            parser.error(
-                "--prune-cache cannot tell stale entries from current ones: the source "
-                "files of hqnn_forge and of this script could not be read when the "
-                "script was imported; run it again once they can be read"
-            )
+            # Read again only to say why; a digest of the files as they are now is not used.
+            try:
+                code_fingerprint()
+            except RuntimeError:
+                reason = (
+                    "hqnn_forge is not imported from Python source files, or holds "
+                    "modules that are not Python source"
+                )
+            except OSError as exc:
+                reason = f"its source files cannot be read ({exc.strerror or exc})"
+            else:
+                reason = (
+                    "its source files could not be read when this script was imported; "
+                    "run it again"
+                )
+            parser.error(f"--prune-cache cannot tell stale entries from current ones: {reason}")
         cache = FeatureCache(args.cache_dir)
         report = cache.prune()
         print(
@@ -2735,6 +2767,12 @@ def main(argv: Sequence[str] | None = None) -> list[dict[str, Any]]:
             failed = ", ".join(f"{p.name} ({err})" for p, err in report.not_removed)
             print(f"stale cache files that could not be removed: {failed}")
         return []
+    # 0 is the one spelling of "no early stopping": a negative value is a typo, not a second one.
+    if args.patience < 0:
+        parser.error(
+            "argument --patience: must be 0 (no early stopping) or an integer >= 1; "
+            f"got {args.patience}"
+        )
     # 0 is the one spelling of "no limit": a negative value is a typo, not a second one.
     if args.max_separation_rows < 0 or 0 < args.max_separation_rows < MIN_SEPARATION_ROWS:
         parser.error(
