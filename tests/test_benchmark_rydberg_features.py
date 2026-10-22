@@ -2815,6 +2815,65 @@ class TestCache:
         assert report == bench.PruneReport(0, 0, (), ())
         assert not stale.exists()
 
+    def test_prune_skips_an_entry_removed_before_it_is_read(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An entry removed by someone else before it is read is not listed as unreadable."""
+        stale = tmp_path / "stale.npz"
+        np.savez(stale, code_sha256=np.array("0" * 64))
+        real_load = np.load
+
+        def vanish(path: Path, *args: Any, **kwargs: Any) -> Any:
+            Path(path).unlink()
+            return real_load(path, *args, **kwargs)
+
+        monkeypatch.setattr(bench.np, "load", vanish)
+        assert bench.FeatureCache(tmp_path).prune() == bench.PruneReport(0, 0, (), ())
+
+    def test_prune_cli_names_the_unreadable_source_file(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A source file that cannot be read is named in the no-digest message (#634)."""
+        missing = tmp_path / "gone.py"
+        monkeypatch.setattr(bench, "CODE_SHA256", None)
+        monkeypatch.setattr(bench, "code_files", lambda *a, **k: {"gone.py": missing})
+        with pytest.raises(SystemExit):
+            bench.main(["--prune-cache", "--cache-dir", str(tmp_path)])
+        error_line = capsys.readouterr().err.strip().splitlines()[-1]
+        assert "its source files cannot be read" in error_line
+        assert str(missing) in error_line
+
+    @pytest.mark.may_skip
+    @pytest.mark.skipif(sys.version_info < (3, 14), reason="ZIP_ZSTANDARD needs Python 3.14+")
+    def test_prune_lists_a_corrupt_zstd_entry_as_unreadable(self, tmp_path: Path) -> None:
+        """A Zstandard member that fails to decode does not abort the prune (#634)."""
+        path = tmp_path / "zstd.npz"
+        members = {
+            "features": np.full((12, 4), 1.0),
+            "seconds": np.float64(0.5),
+            "code_sha256": np.array("0" * 64),
+            "environment": np.array(json.dumps({})),
+        }
+        # getattr: ZIP_ZSTANDARD only exists on 3.14+, which mypy and vermin -t=3.10- check against.
+        zstd = getattr(zipfile, "ZIP_ZSTANDARD")  # noqa: B009
+        with zipfile.ZipFile(path, "w", zstd) as zf:
+            for name, array in members.items():
+                with zf.open(f"{name}.npy", "w") as member:
+                    np.lib.format.write_array(member, np.asanyarray(array), allow_pickle=False)
+        # The first four bytes of a Zstandard frame are its magic number.
+        with zipfile.ZipFile(path) as zf:
+            offset = zf.getinfo("code_sha256.npy").header_offset
+        raw = bytearray(path.read_bytes())
+        name_len, extra_len = struct.unpack("<HH", raw[offset + 26 : offset + 30])
+        start = offset + 30 + name_len + extra_len
+        raw[start : start + 4] = b"\xff\xff\xff\xff"
+        path.write_bytes(bytes(raw))
+
+        report = bench.FeatureCache(tmp_path).prune()
+        assert report.unreadable == (path,)
+        assert report.files == 0
+        assert path.exists()
+
     def test_prune_lists_a_corrupt_lzma_entry_as_unreadable(self, tmp_path: Path) -> None:
         """An LZMA member that fails to decode does not abort the prune (#634)."""
         path = tmp_path / "lzma.npz"
