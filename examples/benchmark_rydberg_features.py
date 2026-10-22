@@ -1673,6 +1673,10 @@ class FeatureCache:
                         raw_env = _stored_environment(stored)
                         entry_key_env = key_environment(raw_env)
                         is_stale = entry_key_env != current_key_env
+            except FileNotFoundError:
+                # Removed meanwhile by another prune, or by hand: there is
+                # nothing to report.
+                continue
             # One damaged member, in a file placed by something else, must not
             # abort the whole prune.
             except _PRUNE_READ_ERRORS:
@@ -1686,8 +1690,8 @@ class FeatureCache:
                     removed_files += 1
                     removed_bytes += size
                 except FileNotFoundError:
-                    # Removed meanwhile by another prune or a fetch() replacing
-                    # it: nothing is left to report, and this process removed nothing.
+                    # Removed meanwhile by another prune, or by hand: nothing is
+                    # left to report, and this process removed nothing.
                     continue
                 except OSError as exc:
                     # strerror only: str(exc) repeats the full path.
@@ -2746,7 +2750,7 @@ def main(argv: Sequence[str] | None = None) -> list[dict[str, Any]]:
                     "modules that are not Python source"
                 )
             except OSError as exc:
-                reason = f"its source files cannot be read ({exc.strerror or exc})"
+                reason = f"its source files cannot be read ({exc})"
             else:
                 reason = (
                     "its source files could not be read when this script was imported; "
