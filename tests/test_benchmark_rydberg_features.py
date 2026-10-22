@@ -32,6 +32,7 @@ import errno
 import hashlib
 import importlib.util
 import json
+import lzma
 import math
 import os
 import re
@@ -2715,7 +2716,33 @@ class TestCache:
             bench.main(["--prune-cache", "--cache-dir", str(tmp_path)])
         error_line = capsys.readouterr().err.strip().splitlines()[-1]
         assert "--prune-cache cannot tell stale entries from current ones" in error_line
+        assert "run it again" in error_line
         assert "--no-cache" not in error_line
+
+    def test_prune_cli_names_unfingerprintable_code(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Code that can never be fingerprinted is not told to run again (#634)."""
+
+        def compiled(*args: object, **kwargs: object) -> dict[str, Path]:
+            raise RuntimeError("hqnn_forge holds a module that is not Python source")
+
+        monkeypatch.setattr(bench, "CODE_SHA256", None)
+        monkeypatch.setattr(bench, "code_files", compiled)
+        with pytest.raises(SystemExit):
+            bench.main(["--prune-cache", "--cache-dir", str(tmp_path)])
+        error_line = capsys.readouterr().err.strip().splitlines()[-1]
+        assert "hqnn_forge is not imported from Python source files" in error_line
+        assert "run it again" not in error_line
+
+    def test_prune_cli_ignores_the_run_options(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """--prune-cache prunes even when a run option such as --patience is invalid (#634)."""
+        assert (
+            bench.main(["--prune-cache", "--cache-dir", str(tmp_path), "--patience", "-1"]) == []
+        )
+        assert f"pruned cache ({tmp_path}): removed 0 files" in capsys.readouterr().out
 
     def test_prune_cli_lists_unreadable_files(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -2759,9 +2786,62 @@ class TestCache:
 
         assert bench.main(["--prune-cache", "--cache-dir", str(tmp_path)]) == []
         out = capsys.readouterr().out
-        assert "stale cache files that could not be removed: stale.npz (" in out
-        assert "Permission denied" in out
+        assert (
+            "stale cache files that could not be removed: stale.npz (Permission denied)\n" in out
+        )
         assert "unreadable cache files" not in out
+
+    def test_prune_skips_a_stale_entry_removed_meanwhile(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An entry removed by someone else before the unlink is neither removed nor failed (#634)."""
+        stale = tmp_path / "stale.npz"
+        np.savez(
+            stale,
+            features=np.full((12, 4), 1.0),
+            seconds=np.float64(0.5),
+            code_sha256=np.array("0" * 64),
+            environment=np.array(json.dumps({})),
+        )
+        real_unlink = Path.unlink
+
+        def vanish(path: Path, missing_ok: bool = False) -> None:
+            real_unlink(path, missing_ok=missing_ok)
+            if path == stale:
+                raise FileNotFoundError(2, "No such file or directory", str(path))
+
+        monkeypatch.setattr(Path, "unlink", vanish)
+        report = bench.FeatureCache(tmp_path).prune()
+        assert report == bench.PruneReport(0, 0, (), ())
+        assert not stale.exists()
+
+    def test_prune_lists_a_corrupt_lzma_entry_as_unreadable(self, tmp_path: Path) -> None:
+        """An LZMA member that fails to decode does not abort the prune (#634)."""
+        path = tmp_path / "lzma.npz"
+        members = {
+            "features": np.full((12, 4), 1.0),
+            "seconds": np.float64(0.5),
+            "code_sha256": np.array("0" * 64),
+            "environment": np.array(json.dumps({})),
+        }
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_LZMA) as zf:
+            for name, array in members.items():
+                with zf.open(f"{name}.npy", "w") as member:
+                    np.lib.format.write_array(member, np.asanyarray(array), allow_pickle=False)
+        # Byte 4 of a zip LZMA stream is the lc/lp/pb properties byte; 0xFF is invalid.
+        with zipfile.ZipFile(path) as zf:
+            offset = zf.getinfo("code_sha256.npy").header_offset
+        raw = bytearray(path.read_bytes())
+        name_len, extra_len = struct.unpack("<HH", raw[offset + 26 : offset + 30])
+        raw[offset + 30 + name_len + extra_len + 4] = 0xFF
+        path.write_bytes(bytes(raw))
+        with pytest.raises(lzma.LZMAError), np.load(path, allow_pickle=False) as stored:
+            stored["code_sha256"]
+
+        report = bench.FeatureCache(tmp_path).prune()
+        assert report.unreadable == (path,)
+        assert report.files == 0
+        assert path.exists()
 
     def test_prune_lists_a_corrupt_compressed_entry_as_unreadable(self, tmp_path: Path) -> None:
         """A compressed member that fails to inflate does not abort the prune (#634)."""
